@@ -3,8 +3,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 import re
 from datetime import datetime
+
+mpl.rcParams['font.family'] = 'Noto Sans CJK JP'
 
 st.set_page_config(page_title="需要データ 可視化ツール", layout="wide")
 st.title("需要データ 可視化ツール (日本トムソン)")
