@@ -4,34 +4,57 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import re
+from datetime import datetime
 
 st.set_page_config(page_title="需要データ 可視化ツール", layout="wide")
-
 st.title("需要データ 可視化ツール (日本トムソン)")
 
 st.markdown("""
 - 入力: Excelファイル（各地区がシート）  
-- 時刻別30分データを自動検出して可視化  
-- kWh→kW換算（30分値は×2）をオプションで切替  
+- 時刻別データを**自動検出**して可視化（30分/60分に対応）  
+- kWh→kW換算は **時間分解能に応じて自動係数** を算出（48本→×2、24本→×1 など）  
 """)
 
 # -------- Utility --------
-TIME_PATTERN = re.compile(r"^\d{1,2}:\d{2}$")
+def _normalize_time_str(x):
+    """文字列化 + 全角コロン置換して返す"""
+    s = str(x).strip()
+    s = s.replace('：', ':')
+    return s
+
+TIME_PATTERN = re.compile(r"^(?:[01]?\d|2[0-4]):[0-5]\d$")  # 0:00〜24:00 まで
 
 def find_time_header_row(df: pd.DataFrame):
-    """時刻ヘッダー行（0:00, 0:30,...が多く含まれる行）を推定して返す"""
+    """
+    時刻ヘッダー行（0:00, 0:30,...が多く含まれる行）を推定して返す
+    - 文字列/時刻/数値混在にも対応（全て文字列化して判定）
+    """
     for ridx in range(len(df)):
         row = df.iloc[ridx]
-        time_like = sum(1 for v in row if isinstance(v, str) and TIME_PATTERN.match(v.strip()))
-        if time_like >= 20:
+        cnt = 0
+        for v in row:
+            s = _normalize_time_str(v)
+            if TIME_PATTERN.match(s):
+                cnt += 1
+        if cnt >= 20:
             return ridx
     return None
 
-def detect_day_column(df: pd.DataFrame, start_row: int, end_row: int):
-    """0列目または1列目など、日(1..31)が入っていそうな列を探索"""
-    candidate_cols = [0,1]
+def detect_time_block_start_col(df: pd.DataFrame, header_row: int):
+    """ヘッダー行のうち、最初に時刻が現れる列インデックス"""
+    row = df.iloc[header_row]
+    for i, v in enumerate(row):
+        s = _normalize_time_str(v)
+        if TIME_PATTERN.match(s):
+            return i
+    return None
+
+def detect_day_column(df: pd.DataFrame, start_row: int, end_row: int, search_cols: int = 6):
+    """
+    日(1..31)が入りそうな列を左から search_cols 列スキャンして最有力を返す
+    """
     best_col, best_hits = None, -1
-    for c in candidate_cols:
+    for c in range(min(search_cols, df.shape[1])):
         hits = 0
         for r in range(start_row, end_row):
             v = df.iloc[r, c]
@@ -46,78 +69,145 @@ def detect_day_column(df: pd.DataFrame, start_row: int, end_row: int):
             best_col = c
     return best_col
 
+def parse_yearmonths_safe(df: pd.DataFrame, upto_row: int):
+    """
+    シート上部から YYYYMM を堅牢に抽出（NaN安全、正規表現）
+    """
+    ym_labels = []
+    ym_re = re.compile(r'(20\d{2})(0[1-9]|1[0-2])')
+    for ridx in range(0, upto_row):
+        v = df.iloc[ridx, 0] if df.shape[1] > 0 else None
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            continue
+        # 数値候補
+        try:
+            iv = int(v)
+            if 200001 <= iv <= 209912:
+                ym_labels.append(f"{iv:06d}")
+                continue
+        except Exception:
+            pass
+        # 文字列から抽出
+        s = str(v)
+        m = ym_re.search(s)
+        if m:
+            ym_labels.append(m.group(1) + m.group(2))
+    # 重複除去しつつ順序維持
+    seen = set()
+    out = []
+    for y in ym_labels:
+        if y not in seen and len(y) == 6:
+            out.append(y)
+            seen.add(y)
+    return out
+
+def infer_interval_minutes(time_labels: pd.Series):
+    """
+    時刻ラベルから分解能（分）を推定（例：['0:00','0:30',...] -> 30）
+    """
+    # 正規化
+    times = [_normalize_time_str(x) for x in list(time_labels)]
+    # 最初の2つの差分で推定（失敗時は30分とする）
+    def to_minutes(t):
+        h, m = t.split(':')
+        return int(h) * 60 + int(m)
+    for i in range(len(times) - 1):
+        a, b = times[i], times[i+1]
+        if TIME_PATTERN.match(a) and TIME_PATTERN.match(b):
+            try:
+                return abs(to_minutes(b) - to_minutes(a)) or 30
+            except Exception:
+                continue
+    # フォールバック：列数で推定
+    n = len(times)
+    if n in (48, 49):  # 49は24:00含む場合
+        return 30
+    if n in (24, 25):
+        return 60
+    return 30
+
 def extract_time_series_block(df: pd.DataFrame):
-    """シートから時刻列とデータ本体（日×時刻の2次元配列）、日列、月セグメント情報を抽出"""
+    """
+    シートから時刻列とデータ本体（日×時刻の2次元配列）、日列、月セグメント情報を抽出
+    """
     time_header_row = find_time_header_row(df)
     if time_header_row is None:
         raise ValueError("時刻ヘッダー行が見つかりませんでした。シートの形式をご確認ください。")
-    row = df.iloc[time_header_row]
-    time_cols = [i for i, v in enumerate(row) if isinstance(v, str) and TIME_PATTERN.match(v.strip())]
-    if not time_cols:
-        raise ValueError("時刻形式の列が検出できませんでした。")
-    first_time_col = min(time_cols)
 
+    first_time_col = detect_time_block_start_col(df, time_header_row)
+    if first_time_col is None:
+        raise ValueError("時刻形式の列が検出できませんでした。")
+
+    # データ行検出
     data_rows = []
-    for ridx in range(time_header_row+1, len(df)):
+    for ridx in range(time_header_row + 1, len(df)):
         vals = df.iloc[ridx, first_time_col:]
         numeric_count = np.sum(pd.to_numeric(vals, errors="coerce").notna())
-        if numeric_count >= 24:
+        if numeric_count >= 12:  # 24/48両対応のため閾値を緩和
             data_rows.append(ridx)
+
+    if not data_rows:
+        raise ValueError("時刻データ行が見つかりませんでした。")
 
     data = df.iloc[data_rows, first_time_col:].apply(pd.to_numeric, errors="coerce")
     time_labels = df.iloc[time_header_row, first_time_col:]
-    day_col = detect_day_column(df, min(data_rows), max(data_rows)+1)
+    # 軸ラベルは文字列に正規化
+    time_labels = pd.Series([_normalize_time_str(x) for x in time_labels])
+
+    # 日付列推定（左数列をスキャン）
+    day_col = detect_day_column(df, min(data_rows), max(data_rows) + 1, search_cols=6)
     day_series = None
     if day_col is not None:
         day_series = df.iloc[data_rows, day_col].reset_index(drop=True)
 
-    ym_labels = []
-    for ridx in range(0, time_header_row):
-        v = df.iloc[ridx, 0]
-        if isinstance(v, (int, float)):
-            iv = int(v)
-            if 200001 <= iv <= 209912:
-                ym_labels.append(str(iv))
-        elif isinstance(v, str) and v.isdigit() and (len(v)==6 or len(v)==8):
-            ym_labels.append(v[:6])
-    ym_labels = [y for y in ym_labels if len(y)==6]
+    # 年月候補抽出
+    ym_labels = parse_yearmonths_safe(df, time_header_row)
 
+    # 月セグメント（day=1で区切り）
     segments = []
     if day_series is not None:
         start = 0
         for i in range(1, len(day_series)):
             try:
-                prev_d = int(day_series.iloc[i-1])
-                cur_d  = int(day_series.iloc[i])
+                prev_d = int(day_series.iloc[i - 1])
+                cur_d = int(day_series.iloc[i])
             except Exception:
                 continue
             if cur_d == 1 and prev_d != 1:
                 segments.append((start, i))
                 start = i
         segments.append((start, len(day_series)))
+    else:
+        # 日列が取れない場合は単一セグメントとして扱う
+        segments = [(0, len(data))]
 
+    # 月ラベル対応付け
     month_map = {}
     for idx, (s, e) in enumerate(segments):
         month_label = ym_labels[idx] if idx < len(ym_labels) else f"Month{idx+1:02d}"
         month_map[month_label] = (s, e)
 
+    # 分解能（分）を推定
+    interval_min = infer_interval_minutes(time_labels)
+
     return {
         "time_labels": time_labels.reset_index(drop=True),
         "data": data.reset_index(drop=True),
         "day_series": day_series,
-        "month_segments": month_map
+        "month_segments": month_map,
+        "interval_minutes": interval_min
     }
 
-def plot_curves(time_labels, curves, labels=None, title=""):
-    plt.figure(figsize=(11,4.5))
+def plot_curves(time_labels, curves, labels=None, title="", y_label="値"):
+    plt.figure(figsize=(11, 4.8))
     for i, y in enumerate(curves):
         if labels and i < len(labels):
             plt.plot(time_labels, y, marker="o", label=labels[i])
         else:
-            plt.plot(time_labels, y, alpha=0.35)
+            plt.plot(time_labels, y, alpha=0.25)
     plt.title(title)
     plt.xlabel("時刻")
-    plt.ylabel("値")
+    plt.ylabel(y_label)
     plt.xticks(rotation=45)
     plt.grid(True)
     if labels:
@@ -125,6 +215,7 @@ def plot_curves(time_labels, curves, labels=None, title=""):
     st.pyplot(plt.gcf())
     plt.close()
 
+# -------- UI --------
 uploaded = st.file_uploader("Excelファイルを選択（例：日本トムソン様_使用量データ.xlsx）", type=["xlsx"])
 
 if uploaded is None:
@@ -135,40 +226,44 @@ xls = pd.ExcelFile(uploaded)
 sheets = [s for s in xls.sheet_names if s not in ("需要場所リスト", )]
 sheet = st.sidebar.selectbox("地区（シート）を選択", sheets)
 
-convert_to_kw = st.sidebar.checkbox("kWh→kW換算（30分値 ×2）", value=True)
-
 df = pd.read_excel(uploaded, sheet_name=sheet, header=None)
 parsed = extract_time_series_block(df)
 time_labels = parsed["time_labels"]
 data = parsed["data"]
 day_series = parsed["day_series"]
 month_segments = parsed["month_segments"]
+interval_min = parsed["interval_minutes"]
+
+# 換算（自動）
+factor = 60.0 / interval_min  # 30分→2, 60分→1
+convert_to_kw = st.sidebar.checkbox(f"kWh→kW換算（自動: ×{factor:.2f}）", value=True)
 
 if convert_to_kw:
-    data_vis = data * 2.0
+    data_vis = data * factor
     y_label = "使用量 [kW]"
 else:
     data_vis = data
-    y_label = "使用量 [kWh/30min]"
+    y_label = f"使用量 [kWh/{int(interval_min)}min]"
 
 tab1, tab2, tab3 = st.tabs(["日単位（1日分）", "月単位（全日重ね）", "年単位（全日重ね）"])
 
 with tab1:
     st.subheader("日単位（1日分）")
-    if day_series is not None and len(month_segments)>0:
+    if day_series is not None and len(month_segments) > 0:
         month_key = st.selectbox("月を選択", list(month_segments.keys()))
         s, e = month_segments[month_key]
+        # 日リストを厳格生成
         days_in_month = pd.to_numeric(day_series.iloc[s:e], errors="coerce").dropna().astype(int).tolist()
-        if len(days_in_month)==0:
+        if len(days_in_month) == 0:
             st.warning("この月セグメントに日データが見つかりません。")
         else:
-            day_pick = st.selectbox("日を選択", days_in_month, index=0)
-            row_idx = s + days_in_month.index(day_pick)
+            idx_in_seg = st.selectbox("日を選択", list(range(len(days_in_month))), index=0, format_func=lambda i: f"{days_in_month[i]}日")
+            row_idx = s + idx_in_seg
             curve = data_vis.iloc[row_idx]
-            st.caption(f"{sheet} / {month_key} / {day_pick}日")
-            plt.figure(figsize=(11,4.5))
+            st.caption(f"{sheet} / {month_key} / {days_in_month[idx_in_seg]}日（分解能: {int(interval_min)}分, 係数: ×{factor:.2f}）")
+            plt.figure(figsize=(11, 4.8))
             plt.plot(time_labels, curve, marker="o")
-            plt.title(f"{sheet} {month_key}-{day_pick:02d} の需要カーブ")
+            plt.title(f"{sheet} {month_key}-{days_in_month[idx_in_seg]:02d} の需要カーブ")
             plt.xlabel("時刻")
             plt.ylabel(y_label)
             plt.xticks(rotation=45)
@@ -180,24 +275,27 @@ with tab1:
 
 with tab2:
     st.subheader("月単位（全日重ね）")
-    if len(month_segments)>0:
+    if len(month_segments) > 0:
         month_key = st.selectbox("月を選択（全日重ね）", list(month_segments.keys()), key="month_overlay")
         s, e = month_segments[month_key]
         curves = [data_vis.iloc[i] for i in range(s, e)]
-        plot_curves(time_labels, curves, labels=None, title=f"{sheet} {month_key} 全日重ね")
+        plot_curves(time_labels, curves, labels=None, title=f"{sheet} {month_key} 全日重ね", y_label=y_label)
     else:
         st.warning("月セグメントが検出できませんでした。")
 
 with tab3:
     st.subheader("年単位（全日重ね）")
     curves = [data_vis.iloc[i] for i in range(len(data_vis))]
-    plt.figure(figsize=(11,4.5))
-    for y in curves:
-        plt.plot(time_labels, y, alpha=0.15)
-    plt.title(f"{sheet} 1年分 全日重ね")
-    plt.xlabel("時刻")
-    plt.ylabel(y_label)
-    plt.xticks(rotation=45)
-    plt.grid(True)
-    st.pyplot(plt.gcf())
-    plt.close()
+    if len(curves) == 0:
+        st.warning("年単位のデータが見つかりません。")
+    else:
+        plt.figure(figsize=(11, 4.8))
+        for y in curves:
+            plt.plot(time_labels, y, alpha=0.12)
+        plt.title(f"{sheet} 1年分 全日重ね")
+        plt.xlabel("時刻")
+        plt.ylabel(y_label)
+        plt.xticks(rotation=45)
+        plt.grid(True)
+        st.pyplot(plt.gcf())
+        plt.close()
